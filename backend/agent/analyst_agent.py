@@ -1,22 +1,24 @@
+"""
+Core Data Analyst Agent — OpenAI GPT-4o with function calling.
+Streams responses via AG-UI SSE protocol.
+"""
 import json
 import os
 import uuid
 from typing import AsyncGenerator
 
-import anthropic
+import openai
 
-from backend.agent.prompts import SYSTEM_PROMPT
 from backend.agent.tools import TOOL_DEFINITIONS, ToolExecutor
 from backend.api.agui_protocol import AGUIEvent, AGUIEventType
-from backend.core.database_manager import DatabaseManager
 from backend.core.session_manager import SessionManager
 
-MODEL = "claude-sonnet-4-6"
-MAX_TOKENS = 8096
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
+MAX_TOKENS = 4096
 
 
 async def run_agent_stream(
-    client: anthropic.AsyncAnthropic,
+    client: openai.AsyncOpenAI,
     system: str,
     messages: list[dict],
     executor: ToolExecutor,
@@ -25,114 +27,130 @@ async def run_agent_stream(
     session_mgr: SessionManager,
 ) -> AsyncGenerator[str, None]:
     """
-    Streaming agent loop with multi-turn tool use.
+    Streaming agent loop with multi-turn OpenAI function calling.
     Yields AG-UI SSE event strings.
     """
-    working_messages = [m for m in messages if m["role"] in ("user", "assistant")]
+    # Build OpenAI message list: system first, then conversation history
+    working_messages: list[dict] = [{"role": "system", "content": system}]
+    for m in messages:
+        if m["role"] in ("user", "assistant") and isinstance(m["content"], str):
+            working_messages.append({"role": m["role"], "content": m["content"]})
 
     yield AGUIEvent.sse(AGUIEventType.RUN_STARTED, {"threadId": thread_id, "runId": run_id})
 
     try:
         while True:
             msg_id = str(uuid.uuid4())[:8]
-            text_started = False
             full_text = ""
-            tool_calls_by_index: dict[int, dict] = {}
+            text_started = False
+            # index → {id, name, args}
+            accumulated_tool_calls: dict[int, dict] = {}
+            finish_reason: str | None = None
 
             yield AGUIEvent.sse(AGUIEventType.STEP_STARTED, {"stepName": "llm_call"})
 
-            async with client.messages.stream(
+            stream = await client.chat.completions.create(
                 model=MODEL,
                 max_tokens=MAX_TOKENS,
-                system=[
-                    {
-                        "type": "text",
-                        "text": system,
-                        "cache_control": {"type": "ephemeral"},
-                    }
-                ],
                 messages=working_messages,
                 tools=TOOL_DEFINITIONS,
-            ) as stream:
-                async for event in stream:
-                    etype = event.type
+                tool_choice="auto",
+                stream=True,
+            )
 
-                    if etype == "content_block_start":
-                        block = event.content_block
-                        idx = event.index
-                        if block.type == "text":
-                            text_started = True
-                            yield AGUIEvent.sse(
-                                AGUIEventType.TEXT_MESSAGE_START,
-                                {"messageId": msg_id, "role": "assistant"},
-                            )
-                        elif block.type == "tool_use":
-                            tool_calls_by_index[idx] = {
-                                "id": block.id,
-                                "name": block.name,
-                                "args_str": "",
+            async for chunk in stream:
+                choice = chunk.choices[0]
+                delta = choice.delta
+
+                # ── Text content ──────────────────────────────────────────
+                if delta.content:
+                    if not text_started:
+                        text_started = True
+                        yield AGUIEvent.sse(
+                            AGUIEventType.TEXT_MESSAGE_START,
+                            {"messageId": msg_id, "role": "assistant"},
+                        )
+                    full_text += delta.content
+                    yield AGUIEvent.sse(
+                        AGUIEventType.TEXT_MESSAGE_CONTENT,
+                        {"messageId": msg_id, "delta": delta.content},
+                    )
+
+                # ── Tool call deltas ──────────────────────────────────────
+                if delta.tool_calls:
+                    for tc_delta in delta.tool_calls:
+                        idx = tc_delta.index
+                        if idx not in accumulated_tool_calls:
+                            accumulated_tool_calls[idx] = {
+                                "id": tc_delta.id or "",
+                                "name": (tc_delta.function.name or "") if tc_delta.function else "",
+                                "args": "",
                             }
                             yield AGUIEvent.sse(
                                 AGUIEventType.TOOL_CALL_START,
                                 {
-                                    "toolCallId": block.id,
-                                    "toolCallName": block.name,
+                                    "toolCallId": accumulated_tool_calls[idx]["id"],
+                                    "toolCallName": accumulated_tool_calls[idx]["name"],
                                     "parentMessageId": msg_id,
                                 },
                             )
 
-                    elif etype == "content_block_delta":
-                        delta = event.delta
-                        idx = event.index
-                        if delta.type == "text_delta":
-                            full_text += delta.text
-                            yield AGUIEvent.sse(
-                                AGUIEventType.TEXT_MESSAGE_CONTENT,
-                                {"messageId": msg_id, "delta": delta.text},
-                            )
-                        elif delta.type == "input_json_delta":
-                            tc = tool_calls_by_index.get(idx)
-                            if tc:
-                                tc["args_str"] += delta.partial_json
+                        tc = accumulated_tool_calls[idx]
+                        # Accumulate id/name in case they arrive in later chunks
+                        if tc_delta.id:
+                            tc["id"] = tc_delta.id
+                        if tc_delta.function:
+                            if tc_delta.function.name:
+                                tc["name"] = tc_delta.function.name
+                            if tc_delta.function.arguments:
+                                tc["args"] += tc_delta.function.arguments
                                 yield AGUIEvent.sse(
                                     AGUIEventType.TOOL_CALL_ARGS,
-                                    {"toolCallId": tc["id"], "delta": delta.partial_json},
+                                    {"toolCallId": tc["id"], "delta": tc_delta.function.arguments},
                                 )
 
-                    elif etype == "content_block_stop":
-                        idx = event.index
-                        if text_started and idx not in tool_calls_by_index:
-                            yield AGUIEvent.sse(
-                                AGUIEventType.TEXT_MESSAGE_END, {"messageId": msg_id}
-                            )
-                            text_started = False
+                if choice.finish_reason:
+                    finish_reason = choice.finish_reason
 
-                final_msg = await stream.get_final_message()
+            # Close text message if open
+            if text_started:
+                yield AGUIEvent.sse(AGUIEventType.TEXT_MESSAGE_END, {"messageId": msg_id})
 
             yield AGUIEvent.sse(AGUIEventType.STEP_FINISHED, {"stepName": "llm_call"})
-
-            # Append assistant turn to working messages
-            working_messages.append({"role": "assistant", "content": final_msg.content})
 
             # Save text to session
             if full_text:
                 session_mgr.add_message(thread_id, "assistant", full_text)
 
-            # Done if no tool use
-            if final_msg.stop_reason != "tool_use":
+            # Build assistant message for working history
+            assistant_msg: dict = {"role": "assistant", "content": full_text or None}
+            if accumulated_tool_calls:
+                assistant_msg["tool_calls"] = [
+                    {
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {"name": tc["name"], "arguments": tc["args"]},
+                    }
+                    for tc in accumulated_tool_calls.values()
+                ]
+            working_messages.append(assistant_msg)
+
+            # Done if no tool calls
+            if finish_reason != "tool_calls" or not accumulated_tool_calls:
                 break
 
-            # Execute tools
-            tool_results = []
-            for block in final_msg.content:
-                if block.type != "tool_use":
-                    continue
+            # ── Execute tool calls ────────────────────────────────────────
+            for tc in accumulated_tool_calls.values():
+                yield AGUIEvent.sse(AGUIEventType.STEP_STARTED, {"stepName": f"tool:{tc['name']}"})
 
-                yield AGUIEvent.sse(AGUIEventType.STEP_STARTED, {"stepName": f"tool:{block.name}"})
+                try:
+                    args = json.loads(tc["args"]) if tc["args"] else {}
+                except json.JSONDecodeError:
+                    args = {}
 
-                result = await executor.execute(block.name, block.input)
+                result = await executor.execute(tc["name"], args)
 
-                # Emit custom events for charts / reports
+                # Emit chart / report custom events
                 if isinstance(result, dict):
                     if "chart" in result:
                         yield AGUIEvent.sse(
@@ -145,18 +163,17 @@ async def run_agent_stream(
                             {"name": "report_ready", "value": result},
                         )
 
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
+                # OpenAI tool result format: role="tool"
+                working_messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
                     "content": json.dumps(result, default=str),
                 })
 
-                yield AGUIEvent.sse(AGUIEventType.TOOL_CALL_END, {"toolCallId": block.id})
-                yield AGUIEvent.sse(AGUIEventType.STEP_FINISHED, {"stepName": f"tool:{block.name}"})
+                yield AGUIEvent.sse(AGUIEventType.TOOL_CALL_END, {"toolCallId": tc["id"]})
+                yield AGUIEvent.sse(AGUIEventType.STEP_FINISHED, {"stepName": f"tool:{tc['name']}"})
 
-            working_messages.append({"role": "user", "content": tool_results})
-
-            # Emit state snapshot
+            # State snapshot after tool round
             session = session_mgr.get(thread_id)
             yield AGUIEvent.sse(
                 AGUIEventType.STATE_SNAPSHOT,

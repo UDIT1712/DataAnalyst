@@ -1,6 +1,6 @@
 # Data Analyst Agent
 
-An advanced AI-powered data analyst with an interactive UI — powered by **Claude claude-sonnet-4-6**, **AG-UI streaming protocol**, **MCP servers**, and **React + Plotly**.
+An advanced AI-powered data analyst with an interactive UI — powered by **OpenAI GPT-4o**, **AG-UI streaming protocol**, **MCP servers**, and **React + Plotly**.
 
 ## Architecture
 
@@ -18,7 +18,7 @@ An advanced AI-powered data analyst with an interactive UI — powered by **Clau
 │                                                          │
 │  ┌─────────────────────────────────────────────────────┐ │
 │  │            Data Analyst Agent (Claude)              │ │
-│  │  claude-sonnet-4-6 + tool_use + streaming + caching │ │
+│  │       GPT-4o + function calling + streaming          │ │
 │  └──────────────┬──────────────────────────────────────┘ │
 │                 │ Tool calls                              │
 │  ┌──────────────▼──────────────────────────────────────┐ │
@@ -49,7 +49,6 @@ An advanced AI-powered data analyst with an interactive UI — powered by **Clau
 | Excel Export | All datasets as separate sheets |
 | Session Memory | Persistent conversation context per thread |
 | Streaming | Real-time AG-UI SSE streaming with tool progress |
-| Prompt Caching | Anthropic ephemeral cache for fast follow-ups |
 
 ## Quick Start
 
@@ -97,7 +96,8 @@ Open **http://localhost:5173**
 
 | Variable | Default | Description |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | — | **Required** — from https://console.anthropic.com |
+| `OPENAI_API_KEY` | — | **Required** — from https://platform.openai.com/api-keys |
+| `OPENAI_MODEL` | `gpt-4o` | Model to use (e.g. `gpt-4o`, `gpt-4-turbo`) |
 | `BACKEND_PORT` | `8000` | FastAPI port |
 | `FRONTEND_URL` | `http://localhost:5173` | CORS origin |
 | `UPLOAD_DIR` | `./uploads` | File upload directory |
@@ -141,7 +141,7 @@ python -m backend.mcp_servers.analytics_server
 
 ## Tech Stack
 
-- **Agent**: Anthropic Claude claude-sonnet-4-6, Python SDK with streaming + prompt caching
+- **Agent**: OpenAI GPT-4o, Python SDK with streaming + function calling
 - **Protocol**: AG-UI (Agent User Interaction) — SSE-based streaming
 - **MCP**: `mcp` Python library — modular tool servers
 - **Backend**: FastAPI, Uvicorn, SQLAlchemy (async)

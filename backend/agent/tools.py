@@ -1,6 +1,6 @@
 """
-Anthropic tool definitions + in-process implementations for the Data Analyst Agent.
-Each tool maps to one of the three MCP server capabilities.
+OpenAI function-calling tool definitions + in-process implementations.
+Tool format: {"type": "function", "function": {"name": ..., "description": ..., "parameters": ...}}
 """
 import json
 import os
@@ -16,189 +16,232 @@ from backend.core.session_manager import SessionManager
 
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "./uploads"))
 
-# ─── Anthropic tool schemas ──────────────────────────────────────────────────
+
+# ─── OpenAI tool schemas ──────────────────────────────────────────────────────
 
 TOOL_DEFINITIONS = [
     {
-        "name": "connect_database",
-        "description": "Connect to a SQL database (SQLite, PostgreSQL, MySQL). Call this before executing any SQL queries.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "url": {
-                    "type": "string",
-                    "description": "Database URL. Examples: sqlite:///./data.db | postgresql://user:pass@host/db | mysql://user:pass@host/db",
+        "type": "function",
+        "function": {
+            "name": "connect_database",
+            "description": "Connect to a SQL database (SQLite, PostgreSQL, MySQL). Call this before executing any SQL queries.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "Database URL. Examples: sqlite:///./data.db | postgresql://user:pass@host/db | mysql://user:pass@host/db",
+                    },
+                    "alias": {"type": "string", "description": "Short name for this connection (default: 'default')"},
                 },
-                "alias": {"type": "string", "description": "Short name for this connection (default: 'default')"},
-            },
-            "required": ["url"],
-        },
-    },
-    {
-        "name": "execute_sql",
-        "description": "Execute a SQL query against the connected database. Always LIMIT to 1000 rows unless user asks for more.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "sql": {"type": "string", "description": "SQL query to run"},
-                "alias": {"type": "string", "description": "Database alias (defaults to active connection)"},
-            },
-            "required": ["sql"],
-        },
-    },
-    {
-        "name": "get_db_schema",
-        "description": "Get the full schema (tables and column types) of the connected database.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "alias": {"type": "string"},
+                "required": ["url"],
             },
         },
     },
     {
-        "name": "load_file",
-        "description": "Load a CSV, Excel, or JSON file from the uploads directory into the analysis session.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "filename": {"type": "string", "description": "Filename in the uploads/ directory"},
-                "name": {"type": "string", "description": "Alias to use for this dataset"},
-                "sheet_name": {"type": "string", "description": "Excel sheet name (optional)"},
-            },
-            "required": ["filename"],
-        },
-    },
-    {
-        "name": "list_uploaded_files",
-        "description": "List all files available in the uploads directory.",
-        "input_schema": {"type": "object", "properties": {}},
-    },
-    {
-        "name": "preview_dataset",
-        "description": "Show the first N rows of a loaded dataset to understand its structure.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "Dataset alias"},
-                "rows": {"type": "integer", "description": "Number of rows (default: 10)"},
-            },
-            "required": ["name"],
-        },
-    },
-    {
-        "name": "statistical_summary",
-        "description": "Compute descriptive statistics (mean, median, std, quartiles, skew) for all columns in a dataset.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "Dataset alias"},
-            },
-            "required": ["name"],
-        },
-    },
-    {
-        "name": "create_chart",
-        "description": "Generate an interactive Plotly chart from a loaded dataset. Returns chart JSON for the frontend to render.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "Dataset alias"},
-                "chart_type": {
-                    "type": "string",
-                    "enum": ["bar", "line", "scatter", "histogram", "box", "pie", "area", "heatmap", "auto"],
-                    "description": "Chart type. Use 'auto' to let the system pick the best type.",
+        "type": "function",
+        "function": {
+            "name": "execute_sql",
+            "description": "Execute a SQL query against the connected database. Always LIMIT to 1000 rows unless user asks for more.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sql": {"type": "string", "description": "SQL query to run"},
+                    "alias": {"type": "string", "description": "Database alias (defaults to active connection)"},
                 },
-                "x": {"type": "string", "description": "Column for x-axis"},
-                "y": {"type": "string", "description": "Column for y-axis"},
-                "color": {"type": "string", "description": "Column to use for color grouping"},
-                "title": {"type": "string", "description": "Chart title"},
+                "required": ["sql"],
             },
-            "required": ["name", "chart_type"],
         },
     },
     {
-        "name": "detect_anomalies",
-        "description": "Find outliers in all numeric columns of a dataset using IQR or Z-score method.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string"},
-                "method": {"type": "string", "enum": ["iqr", "zscore"], "description": "Detection method (default: iqr)"},
-            },
-            "required": ["name"],
-        },
-    },
-    {
-        "name": "correlation_analysis",
-        "description": "Compute a Pearson correlation matrix and identify strongly correlated column pairs.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string"},
-            },
-            "required": ["name"],
-        },
-    },
-    {
-        "name": "time_series_analysis",
-        "description": "Decompose a time series column into trend, seasonal, and residual components.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "Dataset alias"},
-                "date_column": {"type": "string", "description": "Column containing dates"},
-                "value_column": {"type": "string", "description": "Numeric column to decompose"},
-            },
-            "required": ["name", "date_column", "value_column"],
-        },
-    },
-    {
-        "name": "run_prediction",
-        "description": "Train a Gradient Boosting model for regression or classification and return metrics + feature importances.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "Dataset alias"},
-                "target": {"type": "string", "description": "Column to predict"},
-                "features": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "List of feature column names",
+        "type": "function",
+        "function": {
+            "name": "get_db_schema",
+            "description": "Get the full schema (tables and column types) of the connected database.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "alias": {"type": "string"},
                 },
-                "task": {"type": "string", "enum": ["regression", "classification"]},
             },
-            "required": ["name", "target", "features"],
         },
     },
     {
-        "name": "data_quality_report",
-        "description": "Audit a dataset for nulls, duplicates, type mismatches, and memory usage.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string"},
+        "type": "function",
+        "function": {
+            "name": "load_file",
+            "description": "Load a CSV, Excel, or JSON file from the uploads directory into the analysis session.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filename": {"type": "string", "description": "Filename in the uploads/ directory"},
+                    "name": {"type": "string", "description": "Alias to use for this dataset"},
+                    "sheet_name": {"type": "string", "description": "Excel sheet name (optional)"},
+                },
+                "required": ["filename"],
             },
-            "required": ["name"],
         },
     },
     {
-        "name": "generate_report",
-        "description": "Generate a downloadable PDF or Excel report from the current analysis session.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "format": {"type": "string", "enum": ["pdf", "excel"], "description": "Output format"},
-                "title": {"type": "string", "description": "Report title"},
-                "narrative": {"type": "string", "description": "Text narrative/summary to include in the report"},
+        "type": "function",
+        "function": {
+            "name": "list_uploaded_files",
+            "description": "List all files available in the uploads directory.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "preview_dataset",
+            "description": "Show the first N rows of a loaded dataset to understand its structure.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Dataset alias"},
+                    "rows": {"type": "integer", "description": "Number of rows (default: 10)"},
+                },
+                "required": ["name"],
             },
-            "required": ["format", "title"],
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "statistical_summary",
+            "description": "Compute descriptive statistics (mean, median, std, quartiles, skew) for all columns in a dataset.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Dataset alias"},
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_chart",
+            "description": "Generate an interactive Plotly chart from a loaded dataset. Returns chart JSON for the frontend to render.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Dataset alias"},
+                    "chart_type": {
+                        "type": "string",
+                        "enum": ["bar", "line", "scatter", "histogram", "box", "pie", "area", "heatmap", "auto"],
+                        "description": "Chart type. Use 'auto' to let the system pick the best type.",
+                    },
+                    "x": {"type": "string", "description": "Column for x-axis"},
+                    "y": {"type": "string", "description": "Column for y-axis"},
+                    "color": {"type": "string", "description": "Column to use for color grouping"},
+                    "title": {"type": "string", "description": "Chart title"},
+                },
+                "required": ["name", "chart_type"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "detect_anomalies",
+            "description": "Find outliers in all numeric columns of a dataset using IQR or Z-score method.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "method": {"type": "string", "enum": ["iqr", "zscore"], "description": "Detection method (default: iqr)"},
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "correlation_analysis",
+            "description": "Compute a Pearson correlation matrix and identify strongly correlated column pairs.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "time_series_analysis",
+            "description": "Decompose a time series column into trend, seasonal, and residual components.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Dataset alias"},
+                    "date_column": {"type": "string", "description": "Column containing dates"},
+                    "value_column": {"type": "string", "description": "Numeric column to decompose"},
+                },
+                "required": ["name", "date_column", "value_column"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_prediction",
+            "description": "Train a Gradient Boosting model for regression or classification and return metrics + feature importances.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Dataset alias"},
+                    "target": {"type": "string", "description": "Column to predict"},
+                    "features": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of feature column names",
+                    },
+                    "task": {"type": "string", "enum": ["regression", "classification"]},
+                },
+                "required": ["name", "target", "features"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "data_quality_report",
+            "description": "Audit a dataset for nulls, duplicates, type mismatches, and memory usage.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_report",
+            "description": "Generate a downloadable PDF or Excel report from the current analysis session.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "format": {"type": "string", "enum": ["pdf", "excel"], "description": "Output format"},
+                    "title": {"type": "string", "description": "Report title"},
+                    "narrative": {"type": "string", "description": "Text narrative/summary to include in the report"},
+                },
+                "required": ["format", "title"],
+            },
         },
     },
 ]
 
 
-# ─── Tool executor ────────────────────────────────────────────────────────────
+# ─── Tool executor (unchanged — provider-agnostic) ────────────────────────────
 
 class ToolExecutor:
     def __init__(self, db: DatabaseManager, session_mgr: SessionManager, thread_id: str):

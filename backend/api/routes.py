@@ -1,15 +1,16 @@
 import os
 import uuid
 from pathlib import Path
-from typing import Annotated
 
 import aiofiles
+import openai
 from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 from backend.agent.analyst_agent import run_agent_stream
+from backend.agent.prompts import SYSTEM_PROMPT
 from backend.agent.tools import ToolExecutor
 from backend.api.agui_protocol import AGUIEvent, AGUIEventType
 from backend.core.database_manager import DatabaseManager
@@ -29,6 +30,10 @@ def _get_db(thread_id: str) -> DatabaseManager:
     return _db_pool[thread_id]
 
 
+def _make_client() -> openai.AsyncOpenAI:
+    return openai.AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+
 # ─── AG-UI chat endpoint ──────────────────────────────────────────────────────
 
 class AGUIRequest(BaseModel):
@@ -42,49 +47,43 @@ class AGUIRequest(BaseModel):
 @router.post("/chat")
 async def chat(req: AGUIRequest, request: Request):
     """AG-UI compatible SSE streaming endpoint."""
-    import anthropic
-
     session_mgr = request.app.state.session_manager
     thread_id = req.thread_id or str(uuid.uuid4())
     run_id = req.run_id or str(uuid.uuid4())
 
-    # Sync incoming messages into session (only user messages not yet stored)
+    # Sync incoming user messages into session
     existing = session_mgr.get_messages(thread_id)
     for msg in req.messages:
         if msg.get("role") == "user":
             content = msg.get("content", "")
             if isinstance(content, list):
-                content = " ".join(c.get("text", "") for c in content if c.get("type") == "text")
-            # Only add if it's a new message
+                content = " ".join(
+                    c.get("text", "") for c in content if c.get("type") == "text"
+                )
             if not any(
                 m["role"] == "user" and m["content"] == content for m in existing
             ):
                 session_mgr.add_message(thread_id, "user", content)
 
-    # Get the last user message
     all_messages = session_mgr.get_messages(thread_id)
     user_msgs = [m for m in all_messages if m["role"] == "user"]
     if not user_msgs:
         raise HTTPException(400, "No user message provided")
 
-    last_user_msg = user_msgs[-1]["content"]
-
-    db = _get_db(thread_id)
-    executor = ToolExecutor(db, session_mgr, thread_id)
-    client = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-
-    from backend.agent.prompts import SYSTEM_PROMPT
+    # Build system prompt with loaded dataset context
     datasets = session_mgr.get_dataframe_names(thread_id)
     system = SYSTEM_PROMPT
     if datasets:
         system += f"\n\n## Currently loaded datasets: {', '.join(datasets)}"
 
-    messages = session_mgr.get_messages(thread_id)
+    db = _get_db(thread_id)
+    executor = ToolExecutor(db, session_mgr, thread_id)
+    client = _make_client()
 
     async def event_generator():
         try:
             async for chunk in run_agent_stream(
-                client, system, messages, executor, thread_id, run_id, session_mgr
+                client, system, all_messages, executor, thread_id, run_id, session_mgr
             ):
                 yield chunk
         except Exception as e:
@@ -129,8 +128,7 @@ async def list_sessions(request: Request):
 @router.delete("/sessions/{thread_id}")
 async def delete_session(thread_id: str, request: Request):
     session_mgr = request.app.state.session_manager
-    if session_mgr.get(thread_id):
-        session_mgr._sessions.pop(thread_id, None)
+    session_mgr._sessions.pop(thread_id, None)
     return {"status": "deleted"}
 
 
@@ -141,7 +139,11 @@ async def download_report(filename: str):
     path = REPORTS_DIR / filename
     if not path.exists():
         raise HTTPException(404, "Report not found")
-    media = "application/pdf" if filename.endswith(".pdf") else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    media = (
+        "application/pdf"
+        if filename.endswith(".pdf")
+        else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
     return FileResponse(str(path), media_type=media, filename=filename)
 
 
